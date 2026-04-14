@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Clarity Briefing</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="bg-orb orb-a"></div>
+    <div class="bg-orb orb-b"></div>
+
+    <main class="container">
+      <header class="hero card">
+        <p class="eyebrow">REAL-TIME AI INTEL</p>
+        <h1>AI Clarity Briefing</h1>
+        <p class="subtitle">
+          Every visit gives you a fresh, bullet-point view of what matters right now
+          across trusted AI sources.
+        </p>
+        <div class="hero-actions">
+          <button id="refreshBtn" class="btn">Refresh Briefing</button>
+          <p id="lastUpdated" class="timestamp">Loading latest updates...</p>
+        </div>
+      </header>
+
+      <section class="grid">
+        <article class="card digest">
+          <h2>Mission Snapshot</h2>
+          <ul id="headlineBullets" class="bullets"></ul>
+        </article>
+
+        <article class="card digest">
+          <h2>What Is Moving</h2>
+          <ul id="themeBullets" class="bullets"></ul>
+        </article>
+
+        <article class="card digest">
+          <h2>Source Highlights</h2>
+          <ul id="sourceBullets" class="bullets"></ul>
+        </article>
+
+        <article class="card digest">
+          <h2>Feed Health</h2>
+          <ul id="feedHealth" class="bullets"></ul>
+        </article>
+      </section>
+
+      <section class="card updates-wrap">
+        <div class="updates-head">
+          <h2>Latest Items</h2>
+          <p>Live headlines from configured feeds.</p>
+        </div>
+        <div id="updatesList" class="updates-list"></div>
+      </section>
+    </main>
+
+    <template id="updateTemplate">
+      <article class="update-item">
+        <a class="update-title" target="_blank" rel="noopener noreferrer"></a>
+        <p class="update-meta"></p>
+        <p class="update-summary"></p>
+      </article>
+    </template>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
