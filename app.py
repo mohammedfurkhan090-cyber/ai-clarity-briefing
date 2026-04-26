@@ -12,7 +12,7 @@ from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 import feedparser
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 
@@ -223,6 +223,52 @@ def _classify_theme(text: str) -> str:
     return "General AI Developments"
 
 
+ACTION_SUGGESTIONS = {
+    "Model Releases": [
+        "Access the model weights or API",
+        "Review documentation and capabilities",
+        "Try with sample data or use case",
+        "Integrate into your workflow",
+    ],
+    "Agents & Automation": [
+        "Explore workflow automation patterns",
+        "Review integration options",
+        "Test with your data or use case",
+        "Plan implementation steps",
+    ],
+    "Research Breakthroughs": [
+        "Read the abstract and findings",
+        "Review methodology and approach",
+        "Check how it applies to your work",
+        "Share with your team",
+    ],
+    "Product Updates": [
+        "Review API changes and deprecations",
+        "Check documentation updates",
+        "Test integration with your code",
+        "Plan migration if needed",
+    ],
+    "Policy & Safety": [
+        "Review compliance implications",
+        "Assess impact on your systems",
+        "Check updated guidelines",
+        "Update policies if needed",
+    ],
+    "Business & Funding": [
+        "Review market implications",
+        "Assess partnership opportunities",
+        "Monitor competitor activity",
+        "Share insights with stakeholders",
+    ],
+    "General AI Developments": [
+        "Bookmark for later review",
+        "Share with your team",
+        "Add to relevant project",
+        "Follow for updates",
+    ],
+}
+
+
 def _top_terms(updates: list[dict[str, Any]], top_n: int = 5) -> list[str]:
     words = []
     for item in updates:
@@ -294,6 +340,7 @@ def build_digest(updates: list[dict[str, Any]], failures: list[str]) -> dict[str
 
 
 def _serialize_update(item: dict[str, Any]) -> dict[str, Any]:
+    theme = _classify_theme(f"{item['title']} {item['summary']}")
     return {
         "title": item["title"],
         "summary": item["summary"],
@@ -301,6 +348,8 @@ def _serialize_update(item: dict[str, Any]) -> dict[str, Any]:
         "source": item["source"],
         "source_domain": item["source_domain"],
         "published_at": item["published_at"].isoformat(),
+        "theme": theme,
+        "id": hash(item["title"] + item["source"]) & 0x7fffffff,
     }
 
 
@@ -319,6 +368,23 @@ def briefing() -> Any:
             "updates": [_serialize_update(item) for item in updates[:40]],
             "failures": failures,
             "sources": [s.name for s in SOURCES],
+        }
+    )
+
+
+@app.post("/api/generate-actions")
+def generate_actions() -> Any:
+    data = request.get_json()
+    theme = data.get("theme", "General AI Developments")
+    title = data.get("title", "")
+    
+    actions = ACTION_SUGGESTIONS.get(theme, ACTION_SUGGESTIONS["General AI Developments"])
+    
+    return jsonify(
+        {
+            "theme": theme,
+            "title": title,
+            "actions": actions,
         }
     )
 
