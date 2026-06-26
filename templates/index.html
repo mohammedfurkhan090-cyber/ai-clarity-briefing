@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -7,161 +7,116 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
-    <main class="container">
-      <!-- Header / Hero Section -->
-      <header class="hero card">
-        <div class="hero-top-row">
-          <div>
-            <p class="eyebrow">REAL-TIME AI INTEL</p>
-            <h1>AI Clarity Briefing</h1>
-            <p class="subtitle">Fresh, curated view of what matters across trusted AI sources.</p>
-          </div>
-          <button id="themeToggle" class="theme-toggle" title="Toggle dark/light theme">🌙</button>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">AI NEWS OPERATIONS</p>
+          <h1>AI Clarity Briefing</h1>
         </div>
-        <div class="hero-actions">
-          <button id="refreshBtn" class="btn btn-primary">Refresh Briefing</button>
-          <p id="lastUpdated" class="timestamp">Loading...</p>
+        <div class="actions">
+          <button id="impactToggle" class="ghost-btn" type="button" aria-pressed="false">
+            High impact only
+          </button>
+          <button id="refreshBtn" class="primary-btn" type="button">Refresh Briefing</button>
         </div>
       </header>
 
-      <!-- Digest Section (Prominent) -->
-      <section class="digest-hero card">
-        <div class="digest-container">
-          <div class="digest-section">
-            <h2>Mission Snapshot</h2>
-            <ul id="headlineBullets" class="bullets"></ul>
+      <section class="brief-grid">
+        <article class="panel top-brief">
+          <div class="section-head">
+            <p>Top Brief</p>
+            <span id="modelBadge" class="badge">Gemini</span>
           </div>
-          <div class="digest-section">
+          <p id="topSummary" class="summary-copy">Loading AI-organized briefing...</p>
+          <div class="meta-row">
+            <span id="lastUpdated">Loading...</span>
+            <span id="cacheStatus">Cache pending</span>
+          </div>
+        </article>
+
+        <article class="panel health-panel">
+          <div class="section-head">
+            <p>Source Health</p>
+            <span id="aiStatus" class="badge">Checking</span>
+          </div>
+          <dl class="health-grid">
+            <div>
+              <dt>Feeds</dt>
+              <dd id="feedCount">--</dd>
+            </div>
+            <div>
+              <dt>Active</dt>
+              <dd id="activeCount">--</dd>
+            </div>
+            <div>
+              <dt>Items</dt>
+              <dd id="itemCount">--</dd>
+            </div>
+            <div>
+              <dt>Search</dt>
+              <dd id="searchStatus">--</dd>
+            </div>
+          </dl>
+          <p id="failedSources" class="health-note"></p>
+        </article>
+      </section>
+
+      <section class="section">
+        <div class="section-title">
+          <div>
+            <p class="eyebrow">MOVEMENT MAP</p>
             <h2>What Is Moving</h2>
-            <ul id="themeBullets" class="bullets"></ul>
           </div>
         </div>
+        <div id="trendCards" class="trend-grid"></div>
       </section>
 
-      <!-- Controls Section: Filters, Search, Sort -->
-      <section class="controls-panel card">
-        <div class="controls-row">
-          <div class="search-box">
-            <input 
-              type="text" 
-              id="searchInput" 
-              class="search-input" 
-              placeholder="Search articles..." 
-              autocomplete="off"
-            />
-            <span class="search-icon">🔍</span>
+      <section class="section">
+        <div class="section-title controls-title">
+          <div>
+            <p class="eyebrow">LATEST STORIES</p>
+            <h2>Ranked Briefing Cards</h2>
           </div>
-          
-          <div class="filters-group">
-            <button class="filter-btn" id="filterUnread" data-filter="unread" title="Show unread articles">
-              📌 Unread
-            </button>
-            <button class="filter-btn" id="filterBookmarked" data-filter="bookmarked" title="Show bookmarked articles">
-              ⭐ Bookmarked
-            </button>
-            <div class="dropdown">
-              <button class="filter-btn dropdown-toggle" id="sortBtn">
-                ↕️ Sort: Newest
-              </button>
-              <div class="dropdown-menu" id="sortMenu">
-                <button class="dropdown-item" data-sort="newest">Newest First</button>
-                <button class="dropdown-item" data-sort="oldest">Oldest First</button>
-              </div>
-            </div>
-          </div>
-
-          <button class="filter-btn secondary" id="clearFilters" title="Clear all filters">
-            ✕ Clear
-          </button>
+          <div id="categoryFilters" class="filter-row" aria-label="Category filters"></div>
         </div>
-
-        <!-- Theme Filter Chips -->
-        <div class="theme-filter-chips" id="themeChips"></div>
-      </section>
-
-      <!-- Source & Health (Collapsible) -->
-      <details class="details-card card">
-        <summary class="summary-header">
-          <span>ℹ️ Source Highlights & Feed Health</span>
-          <span class="toggle-icon">▶</span>
-        </summary>
-        <div class="details-content">
-          <div class="two-column">
-            <div>
-              <h3>Source Highlights</h3>
-              <ul id="sourceBullets" class="bullets bullets-small"></ul>
-            </div>
-            <div>
-              <h3>Feed Health</h3>
-              <ul id="feedHealth" class="bullets bullets-small"></ul>
-            </div>
-          </div>
-        </div>
-      </details>
-
-      <!-- Latest Items Section -->
-      <section class="card updates-wrap">
-        <div class="updates-head">
-          <h2>Latest Items</h2>
-          <p id="itemsCount">0 articles</p>
-        </div>
-        <div id="updatesList" class="updates-list"></div>
-        <div id="emptyState" class="empty-state" style="display: none;">
-          <p>No articles match your filters. Try clearing filters or adjusting your search.</p>
-        </div>
+        <div id="storyCards" class="story-grid"></div>
       </section>
     </main>
 
-    <!-- Toast Notification -->
-    <div id="toast" class="toast"></div>
-
-    <!-- Action Generation Modal -->
-    <div id="actionModal" class="modal" style="display: none;">
-      <div class="modal-overlay"></div>
-      <div class="modal-content">
-        <div class="modal-header">
-          <h2>Next Steps for This Article</h2>
-          <button class="modal-close" id="closeModal">&times;</button>
+    <template id="trendTemplate">
+      <article class="trend-card">
+        <div class="card-head">
+          <span class="category-chip"></span>
+          <span class="priority-pill"></span>
         </div>
-        <div id="actionTitle" class="action-title"></div>
-        <div id="actionTheme" class="action-theme"></div>
-        <div id="actionsList" class="actions-list"></div>
-        <div class="modal-footer">
-          <button class="btn btn-secondary" id="closeModalBtn">Close</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Templates -->
-    <template id="updateTemplate">
-      <article class="update-item">
-        <div class="update-header">
-          <a class="update-title" target="_blank" rel="noopener noreferrer"></a>
-          <div class="update-actions">
-            <button class="action-btn bookmark-btn" title="Bookmark article">⭐</button>
-            <button class="action-btn actions-btn" title="Generate next steps">✨</button>
-          </div>
-        </div>
-        <p class="update-meta"></p>
-        <p class="update-summary"></p>
-        <div class="update-footer">
-          <span class="theme-badge"></span>
-          <a class="update-link" target="_blank" rel="noopener noreferrer">Read More →</a>
-        </div>
+        <h3></h3>
+        <p></p>
+        <span class="signal"></span>
       </article>
     </template>
 
-    <template id="themeChipTemplate">
-      <button class="theme-chip" data-theme="">
-        <span class="chip-name"></span>
-        <span class="chip-count"></span>
-      </button>
+    <template id="storyTemplate">
+      <article class="story-card">
+        <div class="card-head">
+          <span class="category-chip"></span>
+          <span class="priority-pill"></span>
+        </div>
+        <a class="story-title" target="_blank" rel="noopener noreferrer"></a>
+        <p class="story-meta"></p>
+        <p class="story-summary"></p>
+        <div class="matter-block">
+          <span>Why it matters</span>
+          <p></p>
+        </div>
+        <div class="affected-row"></div>
+        <div class="citation-row"></div>
+      </article>
     </template>
 
     <script src="/static/app.js"></script>

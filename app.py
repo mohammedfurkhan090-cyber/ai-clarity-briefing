@@ -1,27 +1,42 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from collections import Counter, defaultdict
+import os
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from html import unescape
-from re import IGNORECASE, DOTALL, finditer, sub
+from json import JSONDecodeError
+from re import sub
+from threading import Lock
+from time import monotonic
 from typing import Any
 from urllib.error import URLError
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import feedparser
+from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
+from pydantic import BaseModel, Field, field_validator
+
+try:
+    from google import genai
+except ImportError:  # pragma: no cover - exercised when dependencies are missing.
+    genai = None
+
+load_dotenv()
 
 app = Flask(__name__)
+
+CACHE_TTL_SECONDS = int(os.getenv("BRIEFING_CACHE_SECONDS", "900"))
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 
 @dataclass(frozen=True)
 class FeedSource:
     name: str
     url: str
-    kind: str = "feed"
 
 
 SOURCES = [
@@ -37,44 +52,77 @@ SOURCES = [
     FeedSource("arXiv cs.AI", "https://export.arxiv.org/rss/cs.AI"),
     FeedSource("arXiv cs.LG", "https://export.arxiv.org/rss/cs.LG"),
     FeedSource("Hacker News AI", "https://hnrss.org/newest?q=artificial+intelligence"),
-    FeedSource("AIxploria AI News", "https://www.aixploria.com/en/ai-news-today/", "html"),
 ]
 
-THEME_KEYWORDS = {
-    "Model Releases": ["model", "release", "launch", "open source", "weights", "checkpoint"],
-    "Agents & Automation": ["agent", "workflow", "automation", "tool use", "orchestration"],
-    "Research Breakthroughs": ["paper", "research", "benchmark", "arxiv", "sota", "study"],
-    "Product Updates": ["api", "feature", "update", "platform", "assistant", "integration"],
-    "Policy & Safety": ["safety", "policy", "governance", "regulation", "risk", "security"],
-    "Business & Funding": ["startup", "funding", "acquisition", "enterprise", "revenue", "market"],
-}
-
-STOPWORDS = {
-    "the",
-    "a",
-    "an",
-    "for",
-    "to",
-    "and",
-    "of",
-    "in",
-    "on",
-    "with",
-    "at",
-    "from",
-    "by",
-    "is",
-    "are",
-    "be",
-    "as",
-    "new",
-    "ai",
-}
-
 REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AI-Clarity-Briefing/1.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AI-Clarity-Briefing/2.0",
     "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
 }
+
+CATEGORIES = [
+    "Models",
+    "Agents",
+    "Research",
+    "Policy",
+    "Funding",
+    "Products",
+    "Infrastructure",
+    "Safety",
+]
+
+
+class Citation(BaseModel):
+    title: str = Field(description="Readable source or publisher name.")
+    url: str = Field(description="Source URL supporting this card.")
+
+
+class TrendCard(BaseModel):
+    category: str = Field(description="One concise trend category.")
+    title: str = Field(description="Short trend headline.")
+    summary: str = Field(description="Two-sentence explanation of the movement.")
+    signal_count: int = Field(ge=1, le=20, description="Number of stories supporting this trend.")
+    priority: str = Field(description="One of High, Medium, or Low.")
+
+
+class StoryCard(BaseModel):
+    title: str = Field(description="Concise news headline.")
+    source: str = Field(description="Publisher or source name.")
+    url: str = Field(description="Best URL for the story.")
+    published_at: str = Field(description="ISO date or readable publication date.")
+    category: str = Field(description="Best category from the requested category list.")
+    summary: str = Field(description="One or two sentences summarizing the story.")
+    why_it_matters: str = Field(description="Practical importance for AI builders, buyers, or operators.")
+    affected_groups: list[str] = Field(description="Who is likely affected by the story.")
+    priority: str = Field(description="One of High, Medium, or Low.")
+    confidence: str = Field(description="One of High, Medium, or Low.")
+    citations: list[Citation] = Field(description="One or more supporting citations.")
+
+    @field_validator("citations")
+    @classmethod
+    def require_citations(cls, value: list[Citation]) -> list[Citation]:
+        if not value:
+            raise ValueError("story cards must include at least one citation")
+        return value
+
+
+class GeminiBriefing(BaseModel):
+    top_summary: str = Field(description="Executive summary for the full briefing.")
+    trend_cards: list[TrendCard] = Field(min_length=3, max_length=6)
+    story_cards: list[StoryCard] = Field(min_length=6, max_length=12)
+
+
+class FeedItem(BaseModel):
+    title: str
+    summary: str
+    url: str
+    source: str
+    source_domain: str
+    published_at: str
+
+
+_cache_lock = Lock()
+_cached_payload: dict[str, Any] | None = None
+_cached_at = 0.0
 
 
 def _clean_text(value: str) -> str:
@@ -84,8 +132,7 @@ def _clean_text(value: str) -> str:
 
 
 def _parse_dt(entry: dict[str, Any]) -> datetime:
-    date_fields = ("published", "updated", "created")
-    for field in date_fields:
+    for field in ("published", "updated", "created"):
         raw = entry.get(field)
         if not raw:
             continue
@@ -113,78 +160,11 @@ def _load_feed(url: str) -> feedparser.FeedParserDict:
     return feedparser.parse(payload)
 
 
-def _load_html(url: str) -> str:
-    req = Request(url, headers=REQUEST_HEADERS)
-    with urlopen(req, timeout=18) as response:
-        payload = response.read()
-    return payload.decode("utf-8", errors="ignore")
-
-
-def _extract_aixploria_updates(source: FeedSource, html: str, limit: int) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    seen_links: set[str] = set()
-
-    for match in finditer(r"<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", html, IGNORECASE | DOTALL):
-        href = match.group(1).strip()
-        raw_text = match.group(2)
-        link = urljoin(source.url, href)
-        title = _clean_text(raw_text)
-
-        if not link.startswith("https://www.aixploria.com/en/"):
-            continue
-        if any(
-            blocked in link
-            for blocked in (
-                "/en/free-ai/",
-                "/en/category/",
-                "/en/ai-news-today/",
-                "/en/tag/",
-                "/en/privacy",
-                "/en/contact",
-            )
-        ):
-            continue
-        if link in seen_links:
-            continue
-        if len(title) < 12:
-            continue
-
-        seen_links.add(link)
-        items.append(
-            {
-                "title": title,
-                "summary": "AIxploria curated AI news update.",
-                "link": link,
-                "source": source.name,
-                "source_domain": _source_domain(link),
-                "published_at": datetime.now(UTC),
-            }
-        )
-
-        if len(items) >= limit:
-            break
-
-    return items
-
-
-def fetch_all_updates(limit_per_source: int = 12) -> tuple[list[dict[str, Any]], list[str]]:
-    updates: list[dict[str, Any]] = []
+def fetch_feed_updates(limit_per_source: int = 8) -> tuple[list[FeedItem], list[str]]:
+    updates: list[FeedItem] = []
     failures: list[str] = []
 
     for source in SOURCES:
-        if source.kind == "html":
-            try:
-                html = _load_html(source.url)
-                html_items = _extract_aixploria_updates(source, html, limit_per_source)
-                if not html_items:
-                    failures.append(source.name)
-                    continue
-                updates.extend(html_items)
-            except (TimeoutError, URLError, OSError):
-                failures.append(source.name)
-                continue
-            continue
-
         try:
             parsed = _load_feed(source.url)
         except (TimeoutError, URLError, OSError):
@@ -198,159 +178,219 @@ def fetch_all_updates(limit_per_source: int = 12) -> tuple[list[dict[str, Any]],
         for entry in parsed.entries[:limit_per_source]:
             title = _clean_text(entry.get("title", "Untitled"))
             summary = _clean_text(entry.get("summary", entry.get("description", "")))
-            link = entry.get("link", "")
+            url = entry.get("link", "")
             published_at = _parse_dt(entry)
             updates.append(
-                {
-                    "title": title,
-                    "summary": summary,
-                    "link": link,
-                    "source": source.name,
-                    "source_domain": _source_domain(link),
-                    "published_at": published_at,
-                }
+                FeedItem(
+                    title=title,
+                    summary=summary[:700],
+                    url=url,
+                    source=source.name,
+                    source_domain=_source_domain(url),
+                    published_at=published_at.isoformat(),
+                )
             )
 
-    updates.sort(key=lambda x: x["published_at"], reverse=True)
+    updates.sort(key=lambda item: item.published_at, reverse=True)
     return updates, failures
 
 
-def _classify_theme(text: str) -> str:
-    lowered = text.lower()
-    for theme, words in THEME_KEYWORDS.items():
-        if any(w in lowered for w in words):
-            return theme
-    return "General AI Developments"
-
-
-ACTION_SUGGESTIONS = {
-    "Model Releases": [
-        "Access the model weights or API",
-        "Review documentation and capabilities",
-        "Try with sample data or use case",
-        "Integrate into your workflow",
-    ],
-    "Agents & Automation": [
-        "Explore workflow automation patterns",
-        "Review integration options",
-        "Test with your data or use case",
-        "Plan implementation steps",
-    ],
-    "Research Breakthroughs": [
-        "Read the abstract and findings",
-        "Review methodology and approach",
-        "Check how it applies to your work",
-        "Share with your team",
-    ],
-    "Product Updates": [
-        "Review API changes and deprecations",
-        "Check documentation updates",
-        "Test integration with your code",
-        "Plan migration if needed",
-    ],
-    "Policy & Safety": [
-        "Review compliance implications",
-        "Assess impact on your systems",
-        "Check updated guidelines",
-        "Update policies if needed",
-    ],
-    "Business & Funding": [
-        "Review market implications",
-        "Assess partnership opportunities",
-        "Monitor competitor activity",
-        "Share insights with stakeholders",
-    ],
-    "General AI Developments": [
-        "Bookmark for later review",
-        "Share with your team",
-        "Add to relevant project",
-        "Follow for updates",
-    ],
-}
-
-
-def _top_terms(updates: list[dict[str, Any]], top_n: int = 5) -> list[str]:
-    words = []
-    for item in updates:
-        for token in sub(r"[^a-zA-Z0-9 ]", " ", item["title"]).lower().split():
-            if len(token) <= 3 or token in STOPWORDS:
-                continue
-            words.append(token)
-    return [word for word, _ in Counter(words).most_common(top_n)]
-
-
-def build_digest(updates: list[dict[str, Any]], failures: list[str]) -> dict[str, Any]:
-    now = datetime.now(UTC)
-    recent_cutoff = now - timedelta(hours=48)
-    recent = [u for u in updates if u["published_at"] >= recent_cutoff]
-    baseline = recent if recent else updates[:30]
-
-    if not updates:
-        return {
-            "generated_at": now.isoformat(),
-            "headline_bullets": [
-                "No live entries were fetched in this refresh window.",
-                "This usually means your network blocked one or more feed domains temporarily.",
-                "Use Refresh Briefing in a minute; source health below shows exactly what failed.",
-            ],
-            "theme_bullets": ["No themes available until at least one source responds."],
-            "source_bullets": [f"Configured sources: {len(SOURCES)} total."],
+def _seed_payload(updates: list[FeedItem], limit: int = 45) -> list[dict[str, str]]:
+    return [
+        {
+            "title": item.title,
+            "summary": item.summary,
+            "url": item.url,
+            "source": item.source,
+            "published_at": item.published_at,
         }
-
-    theme_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for item in baseline:
-        theme_groups[_classify_theme(f"{item['title']} {item['summary']}")].append(item)
-
-    theme_bullets = []
-    for theme, items in sorted(theme_groups.items(), key=lambda x: len(x[1]), reverse=True)[:4]:
-        exemplar = items[0]["title"]
-        theme_bullets.append(f"{theme}: {len(items)} signals. Lead item - {exemplar}")
-
-    source_snapshot: dict[str, dict[str, Any]] = {}
-    for item in updates:
-        if item["source"] not in source_snapshot:
-            source_snapshot[item["source"]] = item
-
-    source_bullets = [
-        f"{src}: {item['title']}"
-        for src, item in list(source_snapshot.items())[:6]
+        for item in updates[:limit]
     ]
 
-    high_signal_terms = _top_terms(baseline)
-    market_line = (
-        "Fast-moving themes right now: " + ", ".join(high_signal_terms)
-        if high_signal_terms
-        else "Fast-moving themes right now: AI products, model updates, and applied workflows."
+
+def _briefing_prompt(feed_items: list[FeedItem]) -> str:
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    return f"""
+You are the AI editor for AI Clarity Briefing. Build a current, source-backed AI news briefing for {today}.
+
+Use these trusted feed items as seed signals, then use Google Search grounding to verify, update, and discover important current AI stories that may not be in the feeds yet.
+
+Rules:
+- Return only structured JSON matching the schema.
+- Prefer news from the last 7 days. Include older items only if they are still materially relevant.
+- Every story card must include at least one citation URL.
+- Do not invent sources, dates, product names, funding numbers, or URLs.
+- Categories must come from this list: {", ".join(CATEGORIES)}.
+- Priority and confidence must be High, Medium, or Low.
+- Write for founders, product leaders, engineers, analysts, and operators who need signal, not noise.
+
+Seed feed items:
+{_seed_payload(feed_items)}
+""".strip()
+
+
+def _gemini_client() -> Any:
+    if genai is None:
+        raise RuntimeError("google-genai is not installed")
+    if not API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+    return genai.Client(api_key=API_KEY)
+
+
+def _extract_grounding_citations(interaction: Any) -> list[dict[str, str]]:
+    citations: dict[str, dict[str, str]] = {}
+    for step in getattr(interaction, "steps", []) or []:
+        if getattr(step, "type", None) != "model_output":
+            continue
+        for block in getattr(step, "content", []) or []:
+            for annotation in getattr(block, "annotations", []) or []:
+                if getattr(annotation, "type", None) != "url_citation":
+                    continue
+                url = getattr(annotation, "url", "")
+                if not url:
+                    continue
+                citations[url] = {
+                    "title": getattr(annotation, "title", "") or _source_domain(url),
+                    "url": url,
+                }
+    return list(citations.values())
+
+
+def generate_ai_briefing(feed_items: list[FeedItem]) -> tuple[GeminiBriefing, list[dict[str, str]]]:
+    client = _gemini_client()
+    interaction = client.interactions.create(
+        model=GEMINI_MODEL,
+        input=_briefing_prompt(feed_items),
+        tools=[{"type": "google_search"}],
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": GeminiBriefing.model_json_schema(),
+        },
     )
+    briefing = GeminiBriefing.model_validate_json(interaction.output_text)
+    return briefing, _extract_grounding_citations(interaction)
 
-    headline_bullets = [
-        f"{len(recent) if recent else len(baseline)} fresh items in the last 48 hours across {len(set(u['source'] for u in updates))} active sources.",
-        market_line,
-        f"Source health: {len(failures)} feed(s) unavailable during this refresh."
-        if failures
-        else "Source health: all configured feeds responded successfully.",
-    ]
+
+def _fallback_briefing(feed_items: list[FeedItem], error: str) -> dict[str, Any]:
+    story_cards = []
+    for item in feed_items[:10]:
+        story_cards.append(
+            {
+                "title": item.title,
+                "source": item.source,
+                "url": item.url,
+                "published_at": item.published_at,
+                "category": _fallback_category(f"{item.title} {item.summary}"),
+                "summary": item.summary or "No summary available from the source feed.",
+                "why_it_matters": "AI synthesis is unavailable, so this card is showing the source feed summary directly.",
+                "affected_groups": ["AI teams", "Product leaders"],
+                "priority": "Medium",
+                "confidence": "Medium",
+                "citations": [{"title": item.source, "url": item.url}],
+            }
+        )
 
     return {
-        "generated_at": now.isoformat(),
-        "headline_bullets": headline_bullets,
-        "theme_bullets": theme_bullets,
-        "source_bullets": source_bullets,
+        "top_summary": "AI synthesis is unavailable. Showing the latest trusted feed items until Gemini is configured or reachable.",
+        "trend_cards": [
+            {
+                "category": "Source Health",
+                "title": "Gemini synthesis unavailable",
+                "summary": error,
+                "signal_count": max(1, len(feed_items)),
+                "priority": "High",
+            },
+            {
+                "category": "Feed Snapshot",
+                "title": "Trusted feeds are still active",
+                "summary": f"{len(feed_items)} source items were collected from configured feeds.",
+                "signal_count": max(1, len(feed_items)),
+                "priority": "Medium",
+            },
+            {
+                "category": "Next Step",
+                "title": "Add GEMINI_API_KEY for full AI organization",
+                "summary": "Once the key is present, refresh with force mode to generate grounded briefing cards.",
+                "signal_count": 1,
+                "priority": "Medium",
+            },
+        ],
+        "story_cards": story_cards,
     }
 
 
-def _serialize_update(item: dict[str, Any]) -> dict[str, Any]:
-    theme = _classify_theme(f"{item['title']} {item['summary']}")
-    return {
-        "title": item["title"],
-        "summary": item["summary"],
-        "link": item["link"],
-        "source": item["source"],
-        "source_domain": item["source_domain"],
-        "published_at": item["published_at"].isoformat(),
-        "theme": theme,
-        "id": hash(item["title"] + item["source"]) & 0x7fffffff,
+def _fallback_category(text: str) -> str:
+    lowered = text.lower()
+    keyword_map = {
+        "Models": ("model", "release", "weights", "llm", "checkpoint"),
+        "Agents": ("agent", "workflow", "automation", "tool use"),
+        "Research": ("paper", "research", "benchmark", "arxiv", "study"),
+        "Policy": ("policy", "regulation", "law", "governance"),
+        "Funding": ("funding", "startup", "acquisition", "revenue"),
+        "Products": ("api", "feature", "product", "platform"),
+        "Infrastructure": ("chip", "gpu", "datacenter", "inference"),
+        "Safety": ("safety", "security", "risk", "eval"),
     }
+    for category, terms in keyword_map.items():
+        if any(term in lowered for term in terms):
+            return category
+    return "Products"
+
+
+def build_payload(force_refresh: bool = False) -> dict[str, Any]:
+    global _cached_at, _cached_payload
+
+    with _cache_lock:
+        cache_age = monotonic() - _cached_at
+        if not force_refresh and _cached_payload and cache_age < CACHE_TTL_SECONDS:
+            payload = dict(_cached_payload)
+            payload["cache"] = {
+                "status": "hit",
+                "age_seconds": int(cache_age),
+                "ttl_seconds": CACHE_TTL_SECONDS,
+            }
+            return payload
+
+    feed_items, failures = fetch_feed_updates()
+    ai_status = "ok"
+    search_status = "grounded"
+    grounding_citations: list[dict[str, str]] = []
+
+    try:
+        briefing, grounding_citations = generate_ai_briefing(feed_items)
+        briefing_data = briefing.model_dump()
+    except Exception as exc:
+        ai_status = "fallback"
+        search_status = "unavailable"
+        briefing_data = _fallback_briefing(feed_items, str(exc))
+
+    payload = {
+        **briefing_data,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "model": GEMINI_MODEL,
+        "source_health": {
+            "configured_sources": len(SOURCES),
+            "active_sources": len({item.source for item in feed_items}),
+            "feed_items": len(feed_items),
+            "failed_sources": failures,
+            "ai_status": ai_status,
+            "search_status": search_status,
+        },
+        "grounding_citations": grounding_citations,
+        "categories": CATEGORIES,
+        "cache": {
+            "status": "refresh",
+            "age_seconds": 0,
+            "ttl_seconds": CACHE_TTL_SECONDS,
+        },
+    }
+
+    with _cache_lock:
+        _cached_payload = payload
+        _cached_at = monotonic()
+
+    return payload
 
 
 @app.get("/")
@@ -360,34 +400,11 @@ def index() -> str:
 
 @app.get("/api/briefing")
 def briefing() -> Any:
-    updates, failures = fetch_all_updates()
-    digest = build_digest(updates, failures)
-    return jsonify(
-        {
-            "digest": digest,
-            "updates": [_serialize_update(item) for item in updates[:40]],
-            "failures": failures,
-            "sources": [s.name for s in SOURCES],
-        }
-    )
-
-
-@app.post("/api/generate-actions")
-def generate_actions() -> Any:
-    data = request.get_json()
-    theme = data.get("theme", "General AI Developments")
-    title = data.get("title", "")
-    
-    actions = ACTION_SUGGESTIONS.get(theme, ACTION_SUGGESTIONS["General AI Developments"])
-    
-    return jsonify(
-        {
-            "theme": theme,
-            "title": title,
-            "actions": actions,
-        }
-    )
+    force_refresh = request.args.get("force") in {"1", "true", "yes"}
+    return jsonify(build_payload(force_refresh=force_refresh))
 
 
 if __name__ == "__main__":
     app.run(debug=True)
+
+
