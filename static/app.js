@@ -43,10 +43,24 @@ function setPriorityClass(node, priority) {
   node.dataset.priority = (priority || "Medium").toLowerCase();
 }
 
+function aiStatusLabel(health) {
+  if (health.ai_status === "ok") {
+    return health.ai_mode === "feeds_only" ? "AI organized (feeds)" : "AI organized";
+  }
+  if (health.api_key_configured === false) {
+    return "Key missing";
+  }
+  const error = (health.gemini_error || "").toLowerCase();
+  if (error.includes("429") || error.includes("quota") || error.includes("too_many_requests")) {
+    return "Quota limit";
+  }
+  return "Fallback";
+}
+
 function renderHealth(data) {
   const health = data.source_health || {};
   modelBadge.textContent = data.model || "Gemini";
-  aiStatus.textContent = health.ai_status === "ok" ? "AI organized" : "Fallback";
+  aiStatus.textContent = aiStatusLabel(health);
   aiStatus.dataset.status = health.ai_status || "fallback";
   feedCount.textContent = health.configured_sources ?? "--";
   activeCount.textContent = health.active_sources ?? "--";
@@ -54,8 +68,16 @@ function renderHealth(data) {
   searchStatus.textContent = health.search_status || "--";
 
   const failed = health.failed_sources || [];
-  failedSources.textContent = failed.length
-    ? `Unavailable: ${failed.join(", ")}`
+  const geminiError = health.gemini_error || "";
+  const notes = [];
+  if (geminiError) {
+    notes.push(`Gemini: ${geminiError}`);
+  }
+  if (failed.length) {
+    notes.push(`Unavailable feeds: ${failed.join(", ")}`);
+  }
+  failedSources.textContent = notes.length
+    ? notes.join(" | ")
     : "All reachable feeds responded in this refresh.";
 
   const cache = data.cache || {};

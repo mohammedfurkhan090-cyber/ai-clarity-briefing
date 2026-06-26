@@ -21,8 +21,10 @@ from pydantic import BaseModel, Field, field_validator
 
 try:
     from google import genai
+    from google.genai import types
 except ImportError:  # pragma: no cover - exercised when dependencies are missing.
     genai = None
+    types = None
 
 load_dotenv()
 
@@ -256,8 +258,9 @@ def _extract_grounding_citations(interaction: Any) -> list[dict[str, str]]:
     return list(citations.values())
 
 
-def generate_ai_briefing(feed_items: list[FeedItem]) -> tuple[GeminiBriefing, list[dict[str, str]]]:
-    client = _gemini_client()
+def _generate_briefing_with_search(
+    client: Any, feed_items: list[FeedItem]
+) -> tuple[GeminiBriefing, list[dict[str, str]]]:
     interaction = client.interactions.create(
         model=GEMINI_MODEL,
         input=_briefing_prompt(feed_items),
@@ -270,6 +273,69 @@ def generate_ai_briefing(feed_items: list[FeedItem]) -> tuple[GeminiBriefing, li
     )
     briefing = GeminiBriefing.model_validate_json(interaction.output_text)
     return briefing, _extract_grounding_citations(interaction)
+
+
+def _generate_briefing_from_feeds(
+    client: Any, feed_items: list[FeedItem]
+) -> tuple[GeminiBriefing, list[dict[str, str]]]:
+    prompt = _briefing_prompt(feed_items).replace(
+        "then use Google Search grounding to verify, update, and discover important current AI stories that may not be in the feeds yet.",
+        "using only the seed feed items below.",
+    )
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=GeminiBriefing.model_json_schema(),
+        ),
+    )
+    briefing = GeminiBriefing.model_validate_json(response.text)
+    return briefing, []
+
+
+def generate_ai_briefing(feed_items: list[FeedItem]) -> tuple[GeminiBriefing, list[dict[str, str]], str, str]:
+    client = _gemini_client()
+    try:
+        briefing, citations = _generate_briefing_with_search(client, feed_items)
+        return briefing, citations, "grounded", "search"
+    except Exception as search_error:
+        try:
+            briefing, citations = _generate_briefing_from_feeds(client, feed_items)
+            return briefing, citations, "feeds_only", "feeds_only"
+        except Exception:
+            raise search_error from None
+
+
+def _classify_gemini_error(error: str) -> dict[str, str]:
+    lowered = error.lower()
+    if not API_KEY:
+        return {
+            "title": "Gemini API key missing",
+            "summary": "Set GEMINI_API_KEY in Render Environment (production) or in your local .env file.",
+            "next_step_title": "Add GEMINI_API_KEY",
+            "next_step_summary": "In Render: Dashboard -> your service -> Environment -> add GEMINI_API_KEY, save, then redeploy.",
+        }
+    if "429" in error or "quota" in lowered or "too_many_requests" in lowered:
+        return {
+            "title": "Gemini quota exceeded",
+            "summary": error,
+            "next_step_title": "Increase Google AI quota",
+            "next_step_summary": "Your key is configured, but Google rejected the request for quota. Open Google AI Studio, enable billing or wait for the rate limit to reset, then click Refresh Briefing.",
+        }
+    if "401" in error or "403" in error or "invalid" in lowered or "permission" in lowered:
+        return {
+            "title": "Gemini API key rejected",
+            "summary": error,
+            "next_step_title": "Verify the API key",
+            "next_step_summary": "Create a fresh key in Google AI Studio and update GEMINI_API_KEY in Render, then redeploy.",
+        }
+    return {
+        "title": "Gemini synthesis unavailable",
+        "summary": error,
+        "next_step_title": "Check Render logs",
+        "next_step_summary": "Open Render -> Logs after a refresh to inspect the Gemini error, fix the cause, then redeploy if needed.",
+    }
 
 
 def _fallback_briefing(feed_items: list[FeedItem], error: str) -> dict[str, Any]:
@@ -291,13 +357,18 @@ def _fallback_briefing(feed_items: list[FeedItem], error: str) -> dict[str, Any]
             }
         )
 
+    guidance = _classify_gemini_error(error)
+    key_state = "configured" if API_KEY else "missing"
+
     return {
-        "top_summary": "AI synthesis is unavailable. Showing the latest trusted feed items until Gemini is configured or reachable.",
+        "top_summary": (
+            "AI synthesis is unavailable. Showing the latest trusted feed items until Gemini responds successfully."
+        ),
         "trend_cards": [
             {
                 "category": "Source Health",
-                "title": "Gemini synthesis unavailable",
-                "summary": error,
+                "title": guidance["title"],
+                "summary": guidance["summary"],
                 "signal_count": max(1, len(feed_items)),
                 "priority": "High",
             },
@@ -310,13 +381,16 @@ def _fallback_briefing(feed_items: list[FeedItem], error: str) -> dict[str, Any]
             },
             {
                 "category": "Next Step",
-                "title": "Add GEMINI_API_KEY for full AI organization",
-                "summary": "Once the key is present, refresh with force mode to generate grounded briefing cards.",
+                "title": guidance["next_step_title"],
+                "summary": guidance["next_step_summary"],
                 "signal_count": 1,
                 "priority": "Medium",
             },
         ],
         "story_cards": story_cards,
+        "gemini_error": error,
+        "api_key_configured": bool(API_KEY),
+        "api_key_state": key_state,
     }
 
 
@@ -354,19 +428,23 @@ def build_payload(force_refresh: bool = False) -> dict[str, Any]:
 
     feed_items, failures = fetch_feed_updates()
     ai_status = "ok"
+    ai_mode = "search"
     search_status = "grounded"
+    gemini_error = ""
     grounding_citations: list[dict[str, str]] = []
 
     try:
-        briefing, grounding_citations = generate_ai_briefing(feed_items)
+        briefing, grounding_citations, ai_mode, search_status = generate_ai_briefing(feed_items)
         briefing_data = briefing.model_dump()
     except Exception as exc:
         ai_status = "fallback"
+        ai_mode = "fallback"
         search_status = "unavailable"
-        briefing_data = _fallback_briefing(feed_items, str(exc))
+        gemini_error = str(exc)
+        briefing_data = _fallback_briefing(feed_items, gemini_error)
 
     payload = {
-        **briefing_data,
+        **{k: v for k, v in briefing_data.items() if k not in {"gemini_error", "api_key_configured", "api_key_state"}},
         "generated_at": datetime.now(UTC).isoformat(),
         "model": GEMINI_MODEL,
         "source_health": {
@@ -375,7 +453,10 @@ def build_payload(force_refresh: bool = False) -> dict[str, Any]:
             "feed_items": len(feed_items),
             "failed_sources": failures,
             "ai_status": ai_status,
+            "ai_mode": ai_mode,
             "search_status": search_status,
+            "api_key_configured": bool(API_KEY),
+            "gemini_error": gemini_error or briefing_data.get("gemini_error", ""),
         },
         "grounding_citations": grounding_citations,
         "categories": CATEGORIES,
