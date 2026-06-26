@@ -59,7 +59,7 @@ function aiStatusLabel(health) {
 
 function renderHealth(data) {
   const health = data.source_health || {};
-  modelBadge.textContent = data.model || "Gemini";
+  modelBadge.textContent = data.model || "Groq";
   aiStatus.textContent = aiStatusLabel(health);
   aiStatus.dataset.status = health.ai_status || "fallback";
   feedCount.textContent = health.configured_sources ?? "--";
@@ -71,7 +71,7 @@ function renderHealth(data) {
   const geminiError = health.gemini_error || "";
   const notes = [];
   if (geminiError) {
-    notes.push(`Gemini: ${geminiError}`);
+    notes.push(`Groq: ${geminiError}`);
   }
   if (failed.length) {
     notes.push(`Unavailable feeds: ${failed.join(", ")}`);

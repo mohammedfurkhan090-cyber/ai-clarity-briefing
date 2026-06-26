@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,8 +32,11 @@ load_dotenv()
 app = Flask(__name__)
 
 CACHE_TTL_SECONDS = int(os.getenv("BRIEFING_CACHE_SECONDS", "900"))
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
-API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+GROQ_API_URL = os.getenv("GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions")
+TAVILY_API_URL = os.getenv("TAVILY_API_URL", "https://api.tavily.com/search")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 
 @dataclass(frozen=True)
@@ -210,12 +214,73 @@ def _seed_payload(updates: list[FeedItem], limit: int = 45) -> list[dict[str, st
     ]
 
 
+def _tavily_search(query: str, limit: int = 5) -> list[dict[str, str]]:
+    if not TAVILY_API_KEY:
+        return []
+
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": "basic",
+        "max_results": limit,
+        "include_answer": True,
+        "include_raw_content": False,
+    }
+
+    req = Request(
+        TAVILY_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urlopen(req, timeout=45) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (URLError, TimeoutError, OSError, JSONDecodeError):
+        return []
+
+    results = []
+    for item in data.get("results", []) or []:
+        title = item.get("title") or "Untitled"
+        url = item.get("url") or ""
+        content = item.get("content") or item.get("snippet") or ""
+        if not url:
+            continue
+        results.append({"title": title, "url": url, "content": content[:500]})
+    return results
+
+
+def _build_web_context(feed_items: list[FeedItem], limit: int = 6) -> str:
+    queries = []
+    for item in feed_items[:4]:
+        title = (item.title or "").strip()
+        if title:
+            queries.append(title)
+    if not queries:
+        queries.append("latest AI news and product launches")
+
+    sections = []
+    for query in queries[:3]:
+        results = _tavily_search(query, limit=2)
+        if results:
+            lines = [f"Query: {query}"]
+            for result in results:
+                lines.append(f"- {result['title']} | {result['url']} | {result['content']}")
+            sections.append("\n".join(lines))
+
+    if not sections:
+        return ""
+    return "Tavily web search context:\n" + "\n\n".join(sections)
+
+
 def _briefing_prompt(feed_items: list[FeedItem]) -> str:
     today = datetime.now(UTC).strftime("%Y-%m-%d")
+    web_context = _build_web_context(feed_items)
     return f"""
 You are the AI editor for AI Clarity Briefing. Build a current, source-backed AI news briefing for {today}.
 
-Use these trusted feed items as seed signals, then use Google Search grounding to verify, update, and discover important current AI stories that may not be in the feeds yet.
+Use these trusted feed items as seed signals and the Tavily web-search context below to verify current developments and discover important stories that may not yet be in the feeds.
 
 Rules:
 - Return only structured JSON matching the schema.
@@ -228,113 +293,96 @@ Rules:
 
 Seed feed items:
 {_seed_payload(feed_items)}
+
+{web_context if web_context else "No Tavily web search context was available."}
 """.strip()
 
 
-def _gemini_client() -> Any:
-    if genai is None:
-        raise RuntimeError("google-genai is not installed")
+def _groq_request(prompt: str) -> str:
     if not API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is not configured")
-    return genai.Client(api_key=API_KEY)
+        raise RuntimeError("GROQ_API_KEY is not configured")
 
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 4000,
+        "response_format": {"type": "json_object"},
+    }
 
-def _extract_grounding_citations(interaction: Any) -> list[dict[str, str]]:
-    citations: dict[str, dict[str, str]] = {}
-    for step in getattr(interaction, "steps", []) or []:
-        if getattr(step, "type", None) != "model_output":
-            continue
-        for block in getattr(step, "content", []) or []:
-            for annotation in getattr(block, "annotations", []) or []:
-                if getattr(annotation, "type", None) != "url_citation":
-                    continue
-                url = getattr(annotation, "url", "")
-                if not url:
-                    continue
-                citations[url] = {
-                    "title": getattr(annotation, "title", "") or _source_domain(url),
-                    "url": url,
-                }
-    return list(citations.values())
-
-
-def _generate_briefing_with_search(
-    client: Any, feed_items: list[FeedItem]
-) -> tuple[GeminiBriefing, list[dict[str, str]]]:
-    interaction = client.interactions.create(
-        model=GEMINI_MODEL,
-        input=_briefing_prompt(feed_items),
-        tools=[{"type": "google_search"}],
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": GeminiBriefing.model_json_schema(),
+    req = Request(
+        GROQ_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {API_KEY}",
         },
+        method="POST",
     )
-    briefing = GeminiBriefing.model_validate_json(interaction.output_text)
-    return briefing, _extract_grounding_citations(interaction)
+
+    try:
+        with urlopen(req, timeout=90) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except URLError as exc:
+        raise RuntimeError(f"Groq request failed: {exc}") from exc
+
+    if data.get("error"):
+        raise RuntimeError(data["error"].get("message", "Groq request failed"))
+
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("Groq returned no choices")
+
+    content = choices[0].get("message", {}).get("content", "")
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+
+    if not content:
+        raise RuntimeError("Groq returned empty content")
+
+    return content
 
 
-def _generate_briefing_from_feeds(
-    client: Any, feed_items: list[FeedItem]
-) -> tuple[GeminiBriefing, list[dict[str, str]]]:
-    prompt = _briefing_prompt(feed_items).replace(
-        "then use Google Search grounding to verify, update, and discover important current AI stories that may not be in the feeds yet.",
-        "using only the seed feed items below.",
-    )
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=GeminiBriefing.model_json_schema(),
-        ),
-    )
-    briefing = GeminiBriefing.model_validate_json(response.text)
+def _generate_briefing_from_feeds(feed_items: list[FeedItem]) -> tuple[GeminiBriefing, list[dict[str, str]]]:
+    prompt = _briefing_prompt(feed_items)
+    response_text = _groq_request(prompt)
+    briefing = GeminiBriefing.model_validate_json(response_text)
     return briefing, []
 
 
 def generate_ai_briefing(feed_items: list[FeedItem]) -> tuple[GeminiBriefing, list[dict[str, str]], str, str]:
-    client = _gemini_client()
-    try:
-        briefing, citations = _generate_briefing_with_search(client, feed_items)
-        return briefing, citations, "grounded", "search"
-    except Exception as search_error:
-        try:
-            briefing, citations = _generate_briefing_from_feeds(client, feed_items)
-            return briefing, citations, "feeds_only", "feeds_only"
-        except Exception:
-            raise search_error from None
+    briefing, citations = _generate_briefing_from_feeds(feed_items)
+    return briefing, citations, "feeds_only", "unavailable"
 
 
-def _classify_gemini_error(error: str) -> dict[str, str]:
+def _classify_groq_error(error: str) -> dict[str, str]:
     lowered = error.lower()
     if not API_KEY:
         return {
-            "title": "Gemini API key missing",
-            "summary": "Set GEMINI_API_KEY in Render Environment (production) or in your local .env file.",
-            "next_step_title": "Add GEMINI_API_KEY",
-            "next_step_summary": "In Render: Dashboard -> your service -> Environment -> add GEMINI_API_KEY, save, then redeploy.",
+            "title": "Groq API key missing",
+            "summary": "Set GROQ_API_KEY in your local .env file or deployment environment.",
+            "next_step_title": "Add GROQ_API_KEY",
+            "next_step_summary": "Add GROQ_API_KEY in your environment and redeploy.",
         }
-    if "429" in error or "quota" in lowered or "too_many_requests" in lowered:
+    if "429" in error or "quota" in lowered or "rate limit" in lowered or "too_many_requests" in lowered:
         return {
-            "title": "Gemini quota exceeded",
+            "title": "Groq rate limit reached",
             "summary": error,
-            "next_step_title": "Increase Google AI quota",
-            "next_step_summary": "Your key is configured, but Google rejected the request for quota. Open Google AI Studio, enable billing or wait for the rate limit to reset, then click Refresh Briefing.",
+            "next_step_title": "Wait and retry",
+            "next_step_summary": "Your key is configured, but Groq rejected the request due to rate limiting. Wait briefly and try again.",
         }
-    if "401" in error or "403" in error or "invalid" in lowered or "permission" in lowered:
+    if "401" in error or "403" in error or "invalid" in lowered or "permission" in lowered or "unauthorized" in lowered:
         return {
-            "title": "Gemini API key rejected",
+            "title": "Groq API key rejected",
             "summary": error,
             "next_step_title": "Verify the API key",
-            "next_step_summary": "Create a fresh key in Google AI Studio and update GEMINI_API_KEY in Render, then redeploy.",
+            "next_step_summary": "Create a fresh key in Groq Cloud and update GROQ_API_KEY.",
         }
     return {
-        "title": "Gemini synthesis unavailable",
+        "title": "Groq synthesis unavailable",
         "summary": error,
-        "next_step_title": "Check Render logs",
-        "next_step_summary": "Open Render -> Logs after a refresh to inspect the Gemini error, fix the cause, then redeploy if needed.",
+        "next_step_title": "Check logs",
+        "next_step_summary": "Inspect the error details and verify that your Groq model name and key are valid.",
     }
 
 
@@ -357,12 +405,12 @@ def _fallback_briefing(feed_items: list[FeedItem], error: str) -> dict[str, Any]
             }
         )
 
-    guidance = _classify_gemini_error(error)
+    guidance = _classify_groq_error(error)
     key_state = "configured" if API_KEY else "missing"
 
     return {
         "top_summary": (
-            "AI synthesis is unavailable. Showing the latest trusted feed items until Gemini responds successfully."
+            "AI synthesis is unavailable. Showing the latest trusted feed items until Groq responds successfully."
         ),
         "trend_cards": [
             {
@@ -446,7 +494,7 @@ def build_payload(force_refresh: bool = False) -> dict[str, Any]:
     payload = {
         **{k: v for k, v in briefing_data.items() if k not in {"gemini_error", "api_key_configured", "api_key_state"}},
         "generated_at": datetime.now(UTC).isoformat(),
-        "model": GEMINI_MODEL,
+        "model": GROQ_MODEL,
         "source_health": {
             "configured_sources": len(SOURCES),
             "active_sources": len({item.source for item in feed_items}),
